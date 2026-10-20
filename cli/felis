@@ -1,0 +1,864 @@
+#!/usr/bin/env python3
+"""felis: a command-line client for Alice & Bob's Felis API.
+
+Run `felis --help` for usage. See DESIGN.md for the design.
+"""
+
+# This code is part of Qiskit.
+#
+# (C) Copyright 2026 Alice and Bob. All Rights Reserved.
+#
+# This code is licensed under the Apache License, Version 2.0. You may
+# obtain a copy of this license in the LICENSE.txt file in the root directory
+# of this source tree or at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# Any modifications or derivative works of this code must retain this
+# copyright notice, and modified files need to carry a notice indicating
+# that they have been altered from the originals.
+
+# qiskit and qiskit_alice_bob_provider are imported inside the functions that
+# use them, not here: importing them takes about half a second, and this way
+# --help, argument errors and local file errors stay instant. Note that
+# importing the provider also adds instructions such as
+# QuantumCircuit.measure_x (see load_circuit).
+
+import argparse
+import csv
+import http.client
+import io
+import json
+import os
+import runpy
+import sys
+import time
+import traceback
+import urllib.parse
+from dataclasses import dataclass
+from pathlib import Path
+
+API_KEY_VAR = "QRMI_AB_FELIS_API_KEY"
+ENDPOINT_VAR = "QRMI_AB_FELIS_BASE_ENDPOINT"
+DEFAULT_ENDPOINT = "https://api.alice-bob.com/"
+MAX_ERROR_LENGTH = 200
+
+
+# ---------------------------------------------------------------- errors and output
+
+
+class FelisError(Exception):
+    """An error shown to the user as a single `felis: ...` line."""
+
+    exit_code = 1
+
+
+class JobUnsuccessful(FelisError):
+    """The job ended in a failed, cancelled or timed-out state."""
+
+    exit_code = 2
+
+
+class WaitTimeout(FelisError):
+    """The local --timeout expired while the job was still running."""
+
+    exit_code = 3
+
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+
+def print_json(value):
+    print(json.dumps(value, indent=2))
+
+
+def print_text(text):
+    sys.stdout.write(text if text.endswith("\n") else text + "\n")
+
+
+def describe_api_error(error):
+    """Turn an AliceBobApiException into `HTTP <code>: <message>`."""
+    body = str(error).strip()
+    try:
+        data = json.loads(body)
+    except ValueError:
+        data = None
+    message = None
+    if isinstance(data, dict):
+        inner = data.get("error")
+        if isinstance(inner, dict):
+            message = inner.get("message")
+        message = message or data.get("detail")
+    if message is not None and not isinstance(message, str):
+        message = json.dumps(message)
+    # Keep it to one short line: proxies can answer with whole HTML pages.
+    message = " ".join((message or body).split())
+    if len(message) > MAX_ERROR_LENGTH:
+        message = message[: MAX_ERROR_LENGTH - 1] + "…"
+    message = message or http.client.responses.get(error.status_code, "")
+    return f"HTTP {error.status_code}: {message}"
+
+
+def describe_error(error):
+    """One-line description of any error, as shown after `felis: `."""
+    from qiskit_alice_bob_provider.remote.api.client import AliceBobApiException
+
+    if isinstance(error, AliceBobApiException):
+        return describe_api_error(error)
+    return f"{type(error).__name__}: {error}"
+
+
+def is_transient(error):
+    """True for errors worth retrying: lost connections, timeouts, 429 and 5xx."""
+    import requests
+    from qiskit_alice_bob_provider.remote.api.client import AliceBobApiException
+
+    if isinstance(error, AliceBobApiException):
+        return error.status_code == 429 or error.status_code >= 500
+    return isinstance(error, (requests.ConnectionError, requests.Timeout))
+
+
+# ---------------------------------------------------------------- config and client
+
+
+@dataclass
+class Config:
+    api_key: str | None
+    endpoint: str
+    api_key_source: str | None = None  # e.g. "--api-key", "$QRMI_AB_FELIS_API_KEY", "./.env"
+    endpoint_source: str = "default"
+
+
+def load_config(args, require_key=True):
+    """Resolve settings: flag, then environment, then ./.env, then default."""
+    from dotenv import dotenv_values
+
+    dotenv = dotenv_values(Path.cwd() / ".env")
+
+    def setting(flag, flag_name, var):
+        """Return (value, where it came from), or (None, None) if unset."""
+        candidates = (
+            (flag, flag_name),
+            (os.environ.get(var), f"${var}"),
+            (dotenv.get(var), "./.env"),
+        )
+        for value, source in candidates:
+            if value:
+                return value, source
+        return None, None
+
+    api_key, api_key_source = setting(args.api_key, "--api-key", API_KEY_VAR)
+    # Keys read from files often carry a trailing newline.
+    api_key = (api_key or "").strip() or None
+    if api_key is None and require_key:
+        raise FelisError(
+            f"no API key: set {API_KEY_VAR} (in the environment or ./.env) or pass --api-key"
+        )
+    # Never echo the key: requests would quote it in its invalid-header error.
+    if api_key and any(char.isspace() or not char.isprintable() for char in api_key):
+        raise FelisError(f"the API key in {API_KEY_VAR} or --api-key contains invalid characters")
+    endpoint, endpoint_source = setting(args.endpoint, "--endpoint", ENDPOINT_VAR)
+    return Config(
+        api_key=api_key,
+        endpoint=endpoint or DEFAULT_ENDPOINT,
+        api_key_source=api_key_source if api_key else None,
+        endpoint_source=endpoint_source or "default",
+    )
+
+
+def is_alice_bob_host(endpoint):
+    host = urllib.parse.urlparse(endpoint).hostname or ""
+    return host == "alice-bob.com" or host.endswith(".alice-bob.com")
+
+
+def make_client(config):
+    from qiskit_alice_bob_provider.remote.api.client import ApiClient
+
+    # A .env in someone else's checkout could point the endpoint anywhere,
+    # and the key goes with every request.
+    if not is_alice_bob_host(config.endpoint):
+        eprint(
+            f"felis: warning: sending your API key to {config.endpoint} "
+            f"(from {config.endpoint_source})"
+        )
+    return ApiClient(api_key=config.api_key, url=config.endpoint)
+
+
+def client_for(args):
+    """Build an API client from the command line and environment."""
+    return make_client(load_config(args))
+
+
+def mask_key(api_key):
+    """Enough of the key to tell which one it is, never the whole key."""
+    if len(api_key) < 12:
+        return "****"
+    return f"{api_key[:4]}…{api_key[-4:]}"
+
+
+def cmd_config(args):
+    config = load_config(args, require_key=False)
+    api_key = mask_key(config.api_key) if config.api_key else None
+    if args.json:
+        print_json(
+            {
+                "endpoint": config.endpoint,
+                "endpoint_source": config.endpoint_source,
+                "api_key": api_key,
+                "api_key_source": config.api_key_source,
+            }
+        )
+        return
+    rows = [
+        ("endpoint", config.endpoint, f"(from {config.endpoint_source})"),
+        ("api key", api_key or "(not set)", f"(from {config.api_key_source})" if api_key else ""),
+    ]
+    width = max(len(value) for _, value, _ in rows)
+    for name, value, source in rows:
+        print(f"{name:<8}  {value:<{width}}  {source}".rstrip())
+
+
+def add_config_commands(commands):
+    parser = commands.add_parser(
+        "config", help="show the endpoint and API key in use, and where they come from"
+    )
+    parser.add_argument("--json", action="store_true", help="print JSON instead of text")
+    parser.set_defaults(func=cmd_config)
+
+
+# ---------------------------------------------------------------- parameters
+
+
+def parse_params(pairs, shots=None):
+    """Turn KEY=VALUE pairs into inputParams; values are JSON where they parse."""
+    params = {}
+    for pair in pairs or []:
+        key, sep, value = pair.partition("=")
+        if not sep or not key:
+            raise FelisError(f"invalid --param {pair!r}: expected KEY=VALUE")
+        try:
+            params[key] = json.loads(value)
+        except ValueError:
+            params[key] = value
+    if shots is not None:
+        params["nbShots"] = shots
+    return params
+
+
+# ---------------------------------------------------------------- circuits
+
+
+def load_circuit(path):
+    """Run a Python file and return its top-level `circuit`."""
+    from qiskit import QuantumCircuit
+
+    # Importing the provider adds Alice & Bob instructions such as
+    # QuantumCircuit.measure_x, which circuit files may use.
+    import qiskit_alice_bob_provider  # noqa: F401  pylint: disable=unused-import,import-outside-toplevel
+
+    path = Path(path)
+    if not path.is_file():
+        raise FelisError(f"{path}: no such file")
+    # Like `python circuit.py`, let the file import modules next to it.
+    directory = str(path.parent.resolve())
+    sys.path.insert(0, directory)
+    try:
+        circuit = runpy.run_path(str(path)).get("circuit")
+    except (Exception, SystemExit) as error:  # pylint: disable=broad-except
+        raise FelisError(f"{path}: {type(error).__name__}: {error}") from error
+    finally:
+        sys.path.remove(directory)
+    if not isinstance(circuit, QuantumCircuit):
+        raise FelisError(
+            f"{path}: must define a top-level variable `circuit` of type QuantumCircuit"
+        )
+    return circuit
+
+
+def find_target(client, name):
+    from qiskit_alice_bob_provider.remote.api.targets import list_targets
+
+    targets = list_targets(client)
+    for target in targets:
+        if target["name"] == name:
+            return target
+    available = ", ".join(sorted(t["name"] for t in targets))
+    raise FelisError(f"unknown target {name!r}; available targets: {available}")
+
+
+def to_qir(circuit, target_name, client):
+    """Transpile a circuit for a Felis target and return it as QIR."""
+    from qiskit import transpile
+    from qiskit.transpiler import PassManager
+    from qiskit_alice_bob_provider.plugins.state_preparation import EnsurePreparationPass
+    from qiskit_alice_bob_provider.qir import circuit_to_qir
+    from qiskit_alice_bob_provider.remote.backend import AliceBobRemoteBackend
+
+    # The backend is only used for transpilation; nothing is submitted through it.
+    backend = AliceBobRemoteBackend(client, find_target(client, target_name))
+    transpiled = transpile(circuit, backend)
+    # As in AliceBobRemoteBackend.run(), run a final EnsurePreparationPass
+    # after the preset pass manager has run.
+    # This works around https://github.com/Qiskit/qiskit/issues/6943
+    final = PassManager([EnsurePreparationPass()]).run(transpiled)
+    return circuit_to_qir(final)
+
+
+def check_input(path):
+    """Check INPUT is an existing .ll or .py file, before any API call."""
+    path = Path(path)
+    if path.suffix not in (".ll", ".py"):
+        raise FelisError(f"{path}: expected a .ll (QIR) or .py (circuit) file")
+    if not path.is_file():
+        raise FelisError(f"{path}: no such file")
+    return path
+
+
+def read_input(path, target_name, client):
+    """Return QIR for INPUT: a .ll file as-is, or a .py circuit file transpiled."""
+    path = check_input(path)
+    if path.suffix == ".py":
+        return to_qir(load_circuit(path), target_name, client)
+    return path.read_text()
+
+
+def cmd_generate(args):
+    circuit = load_circuit(args.circuit)
+    qir = to_qir(circuit, args.target, client_for(args))
+    if args.output:
+        Path(args.output).write_text(qir)
+    else:
+        print_text(qir)
+
+
+def add_circuit_commands(commands):
+    parser = commands.add_parser("generate", help="transpile a Python circuit file to QIR")
+    parser.add_argument("target", help="Felis target, e.g. EMU:1Q:LESCANNE_2020")
+    parser.add_argument("circuit", help="Python file defining a top-level `circuit`")
+    parser.add_argument("-o", "--output", help="write QIR to this file instead of stdout")
+    parser.set_defaults(func=cmd_generate)
+
+
+# ---------------------------------------------------------------- jobs
+
+TERMINAL_EVENTS = frozenset(
+    {
+        "SUCCEEDED",
+        "COMPILATION_FAILED",
+        "TRANSPILATION_FAILED",
+        "EXECUTION_FAILED",
+        "CANCELLED",
+        "TIMED_OUT",
+    }
+)
+POLL_INTERVAL = 1.0
+MAX_POLL_FAILURES = 5  # consecutive transient errors tolerated while waiting
+
+
+def latest_event(job):
+    events = job.get("events") or []
+    return events[-1]["type"] if events else None
+
+
+def submit(client, target, qir, params):
+    """Create a job and upload its QIR input; return the created job."""
+    from qiskit_alice_bob_provider.remote.api import jobs
+
+    job = jobs.create_job(client, target, params)
+    try:
+        jobs.upload_input(client, job["id"], qir)
+    except KeyboardInterrupt:
+        eprint(f"job {job['id']} was created without input")
+        raise
+    except Exception as error:  # pylint: disable=broad-except
+        raise FelisError(
+            f"job {job['id']} was created but uploading its input failed: {describe_error(error)}"
+        ) from error
+    return job
+
+
+def wait(client, job_id, timeout=None, on_event=None):
+    """Poll a job until it reaches a terminal state, reporting each new event.
+
+    Transient errors (lost connection, 429, 5xx) are retried up to
+    MAX_POLL_FAILURES times in a row, since the job keeps running regardless.
+    """
+    from qiskit_alice_bob_provider.remote.api.jobs import get_job
+
+    start = time.monotonic()
+    seen = 0
+    failures = 0
+    while True:
+        try:
+            job = get_job(client, job_id)
+        except Exception as error:  # pylint: disable=broad-except
+            if not is_transient(error):
+                raise
+            failures += 1
+            if failures > MAX_POLL_FAILURES:
+                raise FelisError(
+                    f"lost contact while waiting for job {job_id} (it may still be running): "
+                    f"{describe_error(error)}"
+                ) from error
+        else:
+            failures = 0
+            events = job.get("events") or []
+            if on_event:
+                for event in events[seen:]:
+                    on_event(event)
+            seen = len(events)
+            if latest_event(job) in TERMINAL_EVENTS:
+                return job
+        if timeout is not None and time.monotonic() - start >= timeout:
+            raise WaitTimeout(f"timed out after {timeout:g}s; job {job_id} is still running")
+        time.sleep(POLL_INTERVAL)
+
+
+def describe_job_error(error):
+    if isinstance(error, dict):
+        return error.get("message") or json.dumps(error)
+    return str(error)
+
+
+def check_succeeded(job):
+    state = latest_event(job)
+    if state == "SUCCEEDED":
+        return
+    message = f"job {job['id']} ended with {state}"
+    errors = "; ".join(describe_job_error(e) for e in job.get("errors") or [])
+    raise JobUnsuccessful(f"{message}: {errors}" if errors else message)
+
+
+def format_event(event):
+    return f"  {event.get('createdAt', '')}  {event['type']}"
+
+
+def parse_counts(output):
+    """Parse the API's histogram CSV (`<bitstring>,<count>` rows)."""
+    return {row[0]: int(row[1]) for row in csv.reader(io.StringIO(output)) if row}
+
+
+def counts(client, job_id):
+    from qiskit_alice_bob_provider.remote.api.jobs import download_output
+
+    output = download_output(client, job_id)
+    if output is None:
+        raise FelisError(f"job {job_id} has no output yet")
+    return parse_counts(output)
+
+
+def print_counts(job_id, result, as_json):
+    if as_json:
+        print_json({"id": job_id, "counts": result})
+        return
+    total = sum(result.values())
+    if not total:
+        print("(no counts)")
+        return
+    width = max(len(bits) for bits in result)
+    for bits, count in sorted(result.items()):
+        print(f"{bits:>{width}}  {count:>8}  {count / total:7.1%}")
+
+
+# ---------------------------------------------------------------- job commands
+
+ARG_TARGET = (("target",), {"help": "Felis target, e.g. EMU:1Q:LESCANNE_2020"})
+ARG_JOB_ID = (("job_id",), {"help": "job ID"})
+ARG_PARAM = (
+    ("--param",),
+    {
+        "action": "append",
+        "default": [],
+        "metavar": "KEY=VALUE",
+        "help": "set an input parameter (VALUE is parsed as JSON); repeatable",
+    },
+)
+ARG_JSON = (("--json",), {"action": "store_true", "help": "print JSON instead of text"})
+ARG_TIMEOUT = (
+    ("--timeout",),
+    {
+        "type": float,
+        "metavar": "S",
+        "help": "stop waiting after S seconds (the job keeps running)",
+    },
+)
+
+
+def add_arguments(parser, *specs):
+    for flags, kwargs in specs:
+        parser.add_argument(*flags, **kwargs)
+
+
+def target_health(client, name):
+    from qiskit_alice_bob_provider.remote.api.client import AliceBobApiException
+
+    try:
+        return client.get(f"v1/targets/{name}/health").json()
+    except AliceBobApiException:
+        return "?"  # one target's health shouldn't break the listing
+
+
+def offer_cancel(client, job_id):
+    """On Ctrl-C: ask whether to cancel (interactive only), else leave the job running."""
+    from qiskit_alice_bob_provider.remote.api.jobs import cancel_job
+
+    # The prompt goes to stderr, so only ask when someone can see it and answer.
+    if sys.stdin.isatty() and sys.stderr.isatty():
+        eprint(f"\ncancel job {job_id}? [y/N] ", end="", flush=True)
+        if sys.stdin.readline().strip().lower() in ("y", "yes"):
+            cancel_job(client, job_id)
+            eprint(f"cancelled job {job_id}")
+            return
+    eprint(f"job {job_id} is still running")
+
+
+def wait_for_result(client, job_id, args):
+    """Block until the job ends, printing events to stderr, then print its counts."""
+    try:
+        job = wait(client, job_id, timeout=args.timeout, on_event=lambda e: eprint(format_event(e)))
+    except KeyboardInterrupt:
+        offer_cancel(client, job_id)
+        raise
+    check_succeeded(job)
+    print_counts(job_id, counts(client, job_id), args.json)
+
+
+def cmd_targets(args):
+    from qiskit_alice_bob_provider.remote.api.targets import list_targets
+
+    client = client_for(args)
+    rows = [
+        {
+            "name": t["name"],
+            "numQubits": t.get("numQubits"),
+            "health": target_health(client, t["name"]),
+        }
+        for t in list_targets(client)
+    ]
+    if args.json:
+        print_json(rows)
+        return
+    width = max([len("NAME")] + [len(row["name"]) for row in rows])
+    print(f"{'NAME':<{width}}  QUBITS  HEALTH")
+    for row in rows:
+        print(f"{row['name']:<{width}}  {row['numQubits']!s:>6}  {row['health']}")
+
+
+def cmd_run(args):
+    check_input(args.input)  # fail on a bad path before asking for an API key
+    params = parse_params(args.param, args.shots)
+    client = client_for(args)
+    qir = read_input(args.input, args.target, client)
+    job_id = submit(client, args.target, qir, params)["id"]
+    if args.no_wait:
+        print(job_id)
+        return
+    eprint(f"job {job_id} submitted to {args.target}")
+    wait_for_result(client, job_id, args)
+
+
+def cmd_status(args):
+    from qiskit_alice_bob_provider.remote.api.jobs import get_job
+
+    job = get_job(client_for(args), args.job_id)
+    if args.json:
+        print_json(job)
+        return
+    print(f"job:    {job['id']}")
+    print(f"target: {job.get('target')}")
+    print(f"state:  {latest_event(job)}")
+    for event in job.get("events") or []:
+        print(format_event(event))
+    for error in job.get("errors") or []:
+        print(f"  error: {describe_job_error(error)}")
+
+
+def cmd_result(args):
+    from qiskit_alice_bob_provider.remote.api.jobs import get_job
+
+    client = client_for(args)
+    if args.wait:
+        wait_for_result(client, args.job_id, args)
+        return
+    job = get_job(client, args.job_id)
+    state = latest_event(job)
+    if state not in TERMINAL_EVENTS:
+        raise FelisError(
+            f"job {args.job_id} has not finished (state: {state}); use --wait to block"
+        )
+    check_succeeded(job)
+    print_counts(args.job_id, counts(client, args.job_id), args.json)
+
+
+LIST_PAGE_SIZE = 100
+ACTIVE_SCAN_LIMIT = 1000  # most recent jobs searched by `job list --active`
+
+
+def list_jobs(client, limit, active=False):
+    """Most recent jobs first; with active=True, only unfinished ones.
+
+    The API can't filter by state, so active jobs are found by scanning pages
+    of recent jobs, stopping after ACTIVE_SCAN_LIMIT jobs.
+    """
+    if not active:
+        return client.get("v1/jobs/", params={"page": 1, "limit": limit}).json()
+    found, page, scanned = [], 1, 0
+    while len(found) < limit and scanned < ACTIVE_SCAN_LIMIT:
+        batch = client.get("v1/jobs/", params={"page": page, "limit": LIST_PAGE_SIZE}).json()
+        found += [job for job in batch if latest_event(job) not in TERMINAL_EVENTS]
+        scanned += len(batch)
+        if len(batch) < LIST_PAGE_SIZE:
+            break
+        page += 1
+    return found[:limit]
+
+
+def cmd_job_list(args):
+    jobs = list_jobs(client_for(args), args.limit, active=not args.all)
+    if args.json:
+        print_json(jobs)
+        return
+    if not jobs:
+        eprint("no jobs" if args.all else "no active jobs (use --all to include finished jobs)")
+        return
+    width = max([len("TARGET")] + [len(job.get("target") or "") for job in jobs])
+    print(f"{'ID':<36}  {'TARGET':<{width}}  {'STATE':<20}  CREATED")
+    for job in jobs:
+        events = job.get("events") or []
+        created = events[0].get("createdAt", "")[:19] if events else ""
+        state = latest_event(job) or ""
+        print(f"{job['id']:<36}  {job.get('target') or '':<{width}}  {state:<20}  {created}")
+
+
+def cmd_cancel(args):
+    from qiskit_alice_bob_provider.remote.api.jobs import cancel_job
+
+    cancel_job(client_for(args), args.job_id)
+    eprint(f"cancelled job {args.job_id}")
+
+
+def add_job_commands(commands):
+    parser = commands.add_parser("targets", help="list targets with their health")
+    add_arguments(parser, ARG_JSON)
+    parser.set_defaults(func=cmd_targets)
+
+    parser = commands.add_parser("run", help="submit a .ll or .py file and wait for the counts")
+    add_arguments(parser, ARG_TARGET)
+    parser.add_argument("input", help="QIR (.ll) or Python circuit (.py) file")
+    parser.add_argument("--shots", type=int, help="number of shots (sets nbShots)")
+    parser.add_argument("--no-wait", action="store_true", help="print the job ID and exit")
+    add_arguments(parser, ARG_PARAM, ARG_TIMEOUT, ARG_JSON)
+    parser.set_defaults(func=cmd_run)
+
+    job = commands.add_parser("job", help="inspect or cancel an existing job")
+    job.set_defaults(help_parser=job)
+    job_commands = job.add_subparsers(title="job commands", metavar="JOB_COMMAND")
+
+    parser = job_commands.add_parser("list", help="list your unfinished jobs, newest first")
+    parser.add_argument("--all", action="store_true", help="include finished jobs")
+    parser.add_argument(
+        "--limit", type=int, default=20, metavar="N", help="show at most N jobs (default: 20)"
+    )
+    add_arguments(parser, ARG_JSON)
+    parser.set_defaults(func=cmd_job_list)
+
+    parser = job_commands.add_parser("status", help="show a job's state and events")
+    add_arguments(parser, ARG_JOB_ID, ARG_JSON)
+    parser.set_defaults(func=cmd_status)
+
+    parser = job_commands.add_parser("result", help="print a finished job's counts")
+    add_arguments(parser, ARG_JOB_ID)
+    parser.add_argument("--wait", action="store_true", help="wait for the job to finish")
+    add_arguments(parser, ARG_TIMEOUT, ARG_JSON)
+    parser.set_defaults(func=cmd_result)
+
+    parser = job_commands.add_parser("cancel", help="cancel a job")
+    add_arguments(parser, ARG_JOB_ID)
+    parser.set_defaults(func=cmd_cancel)
+
+
+# ---------------------------------------------------------------- API commands
+#
+# One command per Felis API endpoint, for debugging. Each handler returns a
+# JSON value (printed as JSON), a str (printed as-is) or None (nothing).
+
+
+def api_health(client, args):
+    return client.get("v1/health/").text
+
+
+def api_list_targets(client, args):
+    from qiskit_alice_bob_provider.remote.api.targets import list_targets
+
+    return list_targets(client)
+
+
+def api_target_health(client, args):
+    return client.get(f"v1/targets/{args.target}/health").json()
+
+
+def api_target_availabilities(client, args):
+    params = {"limit": args.limit, "offset": args.offset}
+    return client.get(f"v1/targets/{args.target}/availabilities", params=params).json()
+
+
+def api_list_jobs(client, args):
+    params = {"page": args.page, "limit": args.limit}
+    return client.get("v1/jobs/", params=params).json()
+
+
+def api_create_job(client, args):
+    from qiskit_alice_bob_provider.remote.api.jobs import create_job
+
+    return create_job(client, args.target, parse_params(args.param))
+
+
+def api_upload_input(client, args):
+    from qiskit_alice_bob_provider.remote.api.jobs import upload_input
+
+    path = Path(args.file)
+    if not path.is_file():
+        raise FelisError(f"{path}: no such file")
+    upload_input(client, args.job_id, path.read_text())
+    eprint(f"uploaded {path} to job {args.job_id}")
+
+
+def api_get_job(client, args):
+    from qiskit_alice_bob_provider.remote.api.jobs import get_job
+
+    return get_job(client, args.job_id)
+
+
+def api_cancel_job(client, args):
+    # The provider's cancel_job discards the response; call the endpoint
+    # directly so the cancelled job is shown.
+    response = client.delete(f"v1/jobs/{args.job_id}")
+    return response.json() if response.content else None
+
+
+def api_get_metrics(client, args):
+    from qiskit_alice_bob_provider.remote.api.jobs import get_job_metrics
+
+    return get_job_metrics(client, args.job_id)
+
+
+def download_handler(kind):
+    """Handler for GET v1/jobs/{id}/<kind>, via the provider's download_<kind>."""
+
+    def handler(client, args):
+        from qiskit_alice_bob_provider.remote.api import jobs
+
+        content = getattr(jobs, f"download_{kind}")(client, args.job_id)
+        if content is None:  # the API answers 409 until the file exists
+            raise FelisError(f"job {args.job_id} has no {kind} yet")
+        return content
+
+    return handler
+
+
+ARG_LIMIT = (("--limit",), {"type": int, "default": 100, "help": "page size (default: 100)"})
+ARG_OFFSET = (("--offset",), {"type": int, "default": 0, "help": "records to skip"})
+ARG_PAGE = (("--page",), {"type": int, "default": 1, "help": "page number (default: 1)"})
+ARG_FILE = (("file",), {"help": "QIR (.ll) file"})
+
+API_COMMANDS = [
+    ("health", api_health, "GET v1/health/", []),
+    ("list-targets", api_list_targets, "GET v1/targets/", []),
+    ("target-health", api_target_health, "GET v1/targets/{target}/health", [ARG_TARGET]),
+    (
+        "target-availabilities",
+        api_target_availabilities,
+        "GET v1/targets/{target}/availabilities",
+        [ARG_TARGET, ARG_LIMIT, ARG_OFFSET],
+    ),
+    ("list-jobs", api_list_jobs, "GET v1/jobs/", [ARG_PAGE, ARG_LIMIT]),
+    ("create-job", api_create_job, "POST v1/jobs/ (no input)", [ARG_TARGET, ARG_PARAM]),
+    ("upload-input", api_upload_input, "POST v1/jobs/{id}/input", [ARG_JOB_ID, ARG_FILE]),
+    ("get-job", api_get_job, "GET v1/jobs/{id}", [ARG_JOB_ID]),
+    ("cancel-job", api_cancel_job, "DELETE v1/jobs/{id}", [ARG_JOB_ID]),
+    ("get-metrics", api_get_metrics, "GET v1/jobs/{id}/metrics", [ARG_JOB_ID]),
+    ("download-input", download_handler("input"), "GET v1/jobs/{id}/input", [ARG_JOB_ID]),
+    (
+        "download-transpiled",
+        download_handler("transpiled"),
+        "GET v1/jobs/{id}/transpiled",
+        [ARG_JOB_ID],
+    ),
+    ("download-output", download_handler("output"), "GET v1/jobs/{id}/output", [ARG_JOB_ID]),
+    ("download-memory", download_handler("memory"), "GET v1/jobs/{id}/memory", [ARG_JOB_ID]),
+]
+
+
+def cmd_api(args):
+    result = args.api_handler(client_for(args), args)
+    if result is None:
+        return
+    if isinstance(result, str):
+        print_text(result)
+    else:
+        print_json(result)
+
+
+def add_api_commands(commands):
+    api = commands.add_parser("api", help="call one Felis API endpoint (for debugging)")
+    api.set_defaults(help_parser=api)
+    api_commands = api.add_subparsers(title="API commands", metavar="API_COMMAND")
+    for name, handler, help_text, specs in API_COMMANDS:
+        parser = api_commands.add_parser(name, help=help_text)
+        add_arguments(parser, *specs)
+        parser.set_defaults(func=cmd_api, api_handler=handler)
+
+
+# ---------------------------------------------------------------- CLI
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    """argparse exits with 2 on usage errors; felis reserves 2 for failed jobs."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(1, f"{self.prog}: error: {message}\n")
+
+
+def build_parser():
+    parser = ArgumentParser(
+        prog="felis", description="Command-line client for Alice & Bob's Felis API."
+    )
+    parser.add_argument("--api-key", help=f"API key (default: ${API_KEY_VAR})")
+    parser.add_argument(
+        "--endpoint", help=f"API base URL (default: ${ENDPOINT_VAR} or {DEFAULT_ENDPOINT})"
+    )
+    parser.add_argument("--debug", action="store_true", help="show full tracebacks")
+    commands = parser.add_subparsers(title="commands", metavar="COMMAND")
+    for add_commands in COMMAND_GROUPS:
+        add_commands(commands)
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not hasattr(args, "func"):
+        getattr(args, "help_parser", parser).print_help(sys.stderr)
+        return 1
+    try:
+        args.func(args)
+        return 0
+    except KeyboardInterrupt:
+        eprint("felis: interrupted")
+        return 130
+    except FelisError as error:
+        if args.debug:
+            traceback.print_exc()
+        eprint(f"felis: {error}")
+        return error.exit_code
+    except Exception as error:  # pylint: disable=broad-except
+        if args.debug:
+            traceback.print_exc()
+        eprint(f"felis: {describe_error(error)}")
+        return 1
+
+
+COMMAND_GROUPS = (add_circuit_commands, add_job_commands, add_api_commands, add_config_commands)
+
+if __name__ == "__main__":
+    sys.exit(main())

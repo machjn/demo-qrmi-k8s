@@ -32,11 +32,13 @@ You will find some sample circuits in [samples/](./samples/)
 
 Felis accepts circuits expressed in QIR, a language which expresses intermediate representations of quantum circuits.
 
-You can modify a Qiskit circuit in [`generate_input.py`](./generate_input.py) before generating it in QIR form as follows:
+Use `felis`, a command-line client for the Felis API, to transpile a Qiskit circuit into QIR. You can modify the circuit in [`circuit.py`](./circuit.py) first:
 
 ```shell-session
-python generate_input.py EMU:1Q:LESCANNE_2020 > generated_circuit.ll
+./felis generate EMU:1Q:LESCANNE_2020 circuit.py > generated_circuit.ll
 ```
+
+A circuit file is a Python file that defines a top-level `circuit` (a `qiskit.QuantumCircuit`). `felis` can also submit circuits and fetch results directly; run `./felis --help` to see its commands.
 
 ## Run
 

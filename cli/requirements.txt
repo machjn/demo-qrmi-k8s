@@ -1,0 +1,2 @@
+python-dotenv
+qiskit-alice-bob-provider>=3.0

@@ -32,4 +32,3 @@ attributes #0 = { "entry_point" "output_labeling_schema" "qir_profiles"="custom"
 !1 = !{i32 7, !"qir_minor_version", i32 0}
 !2 = !{i32 1, !"dynamic_qubit_management", i1 false}
 !3 = !{i32 1, !"dynamic_result_management", i1 false}
-
