@@ -974,3 +974,89 @@ def test_job_list_empty(fake_client, capsys):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "no jobs\n"
+
+
+# ---------------------------------------------------------------- targets show
+
+DESCRIBED_TARGET = {
+    "name": "EMU:2Q:TEST",
+    "numQubits": 2,
+    "instructions": [
+        {"signature": "__quantum__qis__x__body:void (%Qubit*)"},
+        {"signature": "__quantum__qis__s__adj:void (%Qubit*)"},
+        {"signature": "__quantum__qis__cx__body:void (%Qubit*, %Qubit*)"},
+        {"signature": "__quantum__qis__read_result__body:i1 (%Result*)"},
+        {"signature": "something_unexpected"},
+    ],
+    "inputParams": {
+        "nbShots": {
+            "required": True,
+            "type": "int",
+            "default": 1000,
+            "constraints": [{"min": 1.0, "max": 10000000.0}],
+        },
+        "averageNbPhotons": {
+            "required": True,
+            "type": "float",
+            "default": 4.0,
+            "constraints": [{"min": 1.0, "max": 7.5}],
+        },
+        "kappa1": {"required": False, "type": "float", "default": None, "constraints": [{"min": 0.0}]},
+        "memory": {"required": False, "type": "bool", "default": False, "constraints": []},
+    },
+}
+
+
+@pytest.fixture
+def described_target(fake_client):
+    fake_client.routes.update(
+        {
+            ("GET", "v1/targets/"): [DESCRIBED_TARGET],
+            ("GET", "v1/targets/EMU:2Q:TEST/health"): "OK",
+        }
+    )
+    return fake_client
+
+
+def test_targets_show(described_target, capsys):
+    assert felis.main(["targets", "show", "EMU:2Q:TEST"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[:4] == [
+        "target  EMU:2Q:TEST",
+        "qubits  2",
+        "health  OK",
+        "gates   cx, s†, x, something_unexpected",
+    ]
+    assert [line.split() for line in lines[5:]] == [
+        ["PARAMETER", "TYPE", "REQUIRED", "DEFAULT", "RANGE"],
+        ["nbShots", "int", "yes", "1000", "1–10000000"],
+        ["averageNbPhotons", "float", "yes", "4.0", "1–7.5"],
+        ["kappa1", "float", "no", "≥", "0"],
+        ["memory", "bool", "no", "false"],
+    ]
+
+
+def test_targets_show_json_is_raw_description(described_target, capsys):
+    assert felis.main(["targets", "show", "EMU:2Q:TEST", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == DESCRIBED_TARGET
+
+
+def test_targets_show_unknown_target_lists_available(described_target, capsys):
+    assert felis.main(["targets", "show", "NOPE"]) == 1
+    assert "available targets: EMU:2Q:TEST" in capsys.readouterr().err
+
+
+def test_targets_show_real_description(fake_client, capsys):
+    fake_client.routes[("GET", "v1/targets/")] = TARGETS
+    assert felis.main(["targets", "show", LESCANNE]) == 0
+    out = capsys.readouterr().out
+    assert "averageNbPhotons" in out
+    assert "read_result" not in out
+
+
+def test_bare_targets_still_lists(fake_client, capsys):
+    fake_client.routes.update(
+        {("GET", "v1/targets/"): [{"name": "A", "numQubits": 1}], ("GET", "v1/targets/A/health"): "OK"}
+    )
+    assert felis.main(["targets"]) == 0
+    assert capsys.readouterr().out.splitlines()[1].split() == ["A", "1", "OK"]

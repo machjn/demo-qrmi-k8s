@@ -51,6 +51,7 @@ Settings are resolved in order of precedence: a flag beats the environment, whic
 ```
 felis config [--json]
 felis targets [--json]
+felis targets show TARGET [--json]
 felis generate TARGET CIRCUIT.py [-o OUT.ll]
 felis run TARGET INPUT [--shots N] [--param k=v ...] [--no-wait] [--timeout S] [--json]
 felis job list [--all] [--limit N] [--json]
@@ -60,6 +61,9 @@ felis job cancel JOB_ID
 ```
 
 - `targets` prints a table of name, qubit count and health (from `v1/targets/{target}/health`).
+- `targets show` prints one target's qubit count, health, gate names and input parameters (type, required, default, range). The API has no prose description of targets, so this is everything it says about one.
+  - Gate names come from the QIR signatures (`__quantum__qis__<gate>__body`, with `__adj` shown as `<gate>†`). `read_result`, a runtime helper, is left out, and any signature of another shape is shown as-is.
+  - `--json` prints the raw target description.
 - `generate` writes QIR to stdout, or to `-o`.
 - `run`:
   - If `INPUT` ends in `.ll`, it is submitted as-is. If it ends in `.py`, it is loaded and transpiled to QIR first. Any other extension is an error.
@@ -101,7 +105,7 @@ Where the provider has a function for an endpoint (in `qiskit_alice_bob_provider
 
 ## Circuit file convention
 
-A circuit file is a Python file that defines a top-level variable `circuit` of type `qiskit.QuantumCircuit`. `felis` loads it with `runpy.run_path` and reads that variable. A missing or wrongly-typed `circuit` is an error that names the file. `cli/circuit.py` holds the module-2 example, which prepares `+` and measures in the X basis.
+Circuits are Qiskit circuits: a circuit file is a Python file that defines a `qiskit.QuantumCircuit` as a top-level variable named `circuit`. `felis` loads it with `runpy.run_path` and reads that variable. A missing or wrongly-typed `circuit` is an error that names the file. `cli/circuit.py` holds the module-2 example, which prepares `+` and measures in the X basis.
 
 ## Script structure
 
@@ -164,6 +168,6 @@ Each section below is a group of functions in the script:
 
 ### Manual smoke test (production, `EMU:1Q:LESCANNE_2020`)
 
-1. `felis generate EMU:1Q:LESCANNE_2020 circuit.py` produces the same output as `hands-on/module-2/alice-bob/generated_circuit.ll`.
-2. `felis run EMU:1Q:LESCANNE_2020 circuit.py` and `felis run … generated_circuit.ll` both return counts.
+1. `felis generate EMU:1Q:LESCANNE_2020 circuit.py` produces the same output as `cli/testdata/expected_lescanne.ll` (apart from the `circuit-<N>` module name).
+2. `felis run EMU:1Q:LESCANNE_2020 circuit.py` and `felis run EMU:1Q:LESCANNE_2020 testdata/expected_lescanne.ll` both return counts.
 3. Each `felis api …` command runs once against a real job.

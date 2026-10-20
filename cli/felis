@@ -28,6 +28,7 @@ import http.client
 import io
 import json
 import os
+import re
 import runpy
 import sys
 import time
@@ -307,14 +308,16 @@ def check_input(path):
     """Check INPUT is an existing .ll or .py file, before any API call."""
     path = Path(path)
     if path.suffix not in (".ll", ".py"):
-        raise FelisError(f"{path}: expected a .ll (QIR) or .py (circuit) file")
+        raise FelisError(
+            f"{path}: expected a QIR file (.ll) or a Python file defining a Qiskit circuit (.py)"
+        )
     if not path.is_file():
         raise FelisError(f"{path}: no such file")
     return path
 
 
 def read_input(path, target_name, client):
-    """Return QIR for INPUT: a .ll file as-is, or a .py circuit file transpiled."""
+    """Return QIR for INPUT: a .ll file as-is, or the Qiskit circuit in a .py file, transpiled."""
     path = check_input(path)
     if path.suffix == ".py":
         return to_qir(load_circuit(path), target_name, client)
@@ -331,9 +334,11 @@ def cmd_generate(args):
 
 
 def add_circuit_commands(commands):
-    parser = commands.add_parser("generate", help="transpile a Python circuit file to QIR")
+    parser = commands.add_parser("generate", help="transpile a Qiskit circuit to QIR")
     parser.add_argument("target", help="Felis target, e.g. EMU:1Q:LESCANNE_2020")
-    parser.add_argument("circuit", help="Python file defining a top-level `circuit`")
+    parser.add_argument(
+        "circuit", help="Python file defining a Qiskit QuantumCircuit named `circuit`"
+    )
     parser.add_argument("-o", "--output", help="write QIR to this file instead of stdout")
     parser.set_defaults(func=cmd_generate)
 
@@ -543,6 +548,63 @@ def cmd_targets(args):
         print(f"{row['name']:<{width}}  {row['numQubits']!s:>6}  {row['health']}")
 
 
+QIS_SIGNATURE = re.compile(r"__quantum__qis__(\w+?)__(body|adj)\b")
+
+
+def gate_names(target):
+    """Gate names from a target's QIR signatures, e.g. `__quantum__qis__s__adj` -> `s†`."""
+    gates, unknown = set(), []
+    for instruction in target.get("instructions") or []:
+        signature = instruction.get("signature", "")
+        match = QIS_SIGNATURE.match(signature)
+        if not match:
+            unknown.append(signature)  # unexpected shape: show it as-is, last
+        elif match[1] != "read_result":  # a runtime helper, not a gate
+            gates.add(match[1] + ("†" if match[2] == "adj" else ""))
+    return sorted(gates) + unknown
+
+
+def cmd_targets_show(args):
+    client = client_for(args)
+    target = find_target(client, args.target)
+    if args.json:
+        print_json(target)
+        return
+    print(f"target  {target['name']}")
+    print(f"qubits  {target.get('numQubits')}")
+    print(f"health  {target_health(client, target['name'])}")
+    print(f"gates   {', '.join(gate_names(target))}")
+    print()
+    rows = [
+        (
+            name,
+            param.get("type", ""),
+            "yes" if param.get("required") else "no",
+            "" if param.get("default") is None else json.dumps(param["default"]),
+            ", ".join(format_constraint(c) for c in param.get("constraints") or []),
+        )
+        for name, param in (target.get("inputParams") or {}).items()
+    ]
+    header = ("PARAMETER", "TYPE", "REQUIRED", "DEFAULT", "RANGE")
+    widths = [max(len(row[i]) for row in [header, *rows]) for i in range(len(header))]
+    for row in [header, *rows]:
+        print("  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip())
+
+
+def format_constraint(constraint):
+    def number(value):
+        return str(int(value)) if float(value).is_integer() else str(value)
+
+    low, high = constraint.get("min"), constraint.get("max")
+    if low is not None and high is not None:
+        return f"{number(low)}–{number(high)}"
+    if low is not None:
+        return f"≥ {number(low)}"
+    if high is not None:
+        return f"≤ {number(high)}"
+    return json.dumps(constraint)
+
+
 def cmd_run(args):
     check_input(args.input)  # fail on a bad path before asking for an API key
     params = parse_params(args.param, args.shots)
@@ -637,13 +699,23 @@ def cmd_cancel(args):
 
 
 def add_job_commands(commands):
-    parser = commands.add_parser("targets", help="list targets with their health")
-    add_arguments(parser, ARG_JSON)
-    parser.set_defaults(func=cmd_targets)
+    targets = commands.add_parser("targets", help="list targets, or show one with `targets show`")
+    add_arguments(targets, ARG_JSON)
+    targets.set_defaults(func=cmd_targets)  # bare `felis targets` lists them
+    target_commands = targets.add_subparsers(title="targets commands", metavar="TARGETS_COMMAND")
+    parser = target_commands.add_parser(
+        "show", help="show a target's qubits, health, gates and input parameters"
+    )
+    add_arguments(parser, ARG_TARGET, ARG_JSON)
+    parser.set_defaults(func=cmd_targets_show)
 
-    parser = commands.add_parser("run", help="submit a .ll or .py file and wait for the counts")
+    parser = commands.add_parser(
+        "run", help="submit QIR or a Qiskit circuit and wait for the counts"
+    )
     add_arguments(parser, ARG_TARGET)
-    parser.add_argument("input", help="QIR (.ll) or Python circuit (.py) file")
+    parser.add_argument(
+        "input", help="QIR file (.ll), or Python file defining a Qiskit circuit (.py)"
+    )
     parser.add_argument("--shots", type=int, help="number of shots (sets nbShots)")
     parser.add_argument("--no-wait", action="store_true", help="print the job ID and exit")
     add_arguments(parser, ARG_PARAM, ARG_TIMEOUT, ARG_JSON)

@@ -38,7 +38,7 @@ Use `felis`, a command-line client for the Felis API, to transpile a Qiskit circ
 ./felis generate EMU:1Q:LESCANNE_2020 circuit.py > generated_circuit.ll
 ```
 
-A circuit file is a Python file that defines a top-level `circuit` (a `qiskit.QuantumCircuit`). `felis` can also submit circuits and fetch results directly; run `./felis --help` to see its commands.
+`circuit.py` defines a Qiskit `QuantumCircuit` as a top-level variable named `circuit`.
 
 ## Run
 
@@ -46,6 +46,12 @@ For example:
 
 ```shell-session
 python example.py ab_emu_1q_lescanne_2020 generated_circuit.ll
+```
+
+If transpiling doesn't work for you, use a pre-transpiled circuit from [samples/pre-transpiled/](./samples/pre-transpiled/) instead:
+
+```shell-session
+python example.py ab_emu_1q_lescanne_2020 samples/pre-transpiled/coin_flip.EMU-1Q-LESCANNE_2020.ll
 ```
 
 

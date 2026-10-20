@@ -30,7 +30,8 @@ To see which endpoint and key are in use, and where each comes from, run `felis 
 ```shell-session
 felis config                                           # endpoint and (masked) key in use, and their sources
 felis targets                                          # list targets and their health
-felis generate EMU:1Q:LESCANNE_2020 circuit.py > c.ll  # Python circuit -> QIR
+felis targets show EMU:1Q:LESCANNE_2020               # a target's gates and input parameters
+felis generate EMU:1Q:LESCANNE_2020 circuit.py > c.ll  # Qiskit circuit -> QIR
 felis run EMU:1Q:LESCANNE_2020 circuit.py --shots 100  # transpile, submit, wait, print counts
 felis run EMU:1Q:LESCANNE_2020 c.ll --no-wait          # submit QIR, print the job ID
 felis job list [--all]                                 # unfinished jobs (--all: include finished ones)
@@ -39,9 +40,9 @@ felis job result JOB_ID --wait
 felis job cancel JOB_ID
 ```
 
-A circuit file is a Python file that defines a top-level `circuit` (a `qiskit.QuantumCircuit`). See [`circuit.py`](circuit.py).
+Circuits are Qiskit circuits: a Python file that defines a `qiskit.QuantumCircuit` as a top-level variable named `circuit`. See [`circuit.py`](circuit.py).
 
-Set target input parameters with `--param KEY=VALUE` (repeatable; values are parsed as JSON), e.g. `--param averageNbPhotons=4`.
+Set target input parameters (see `felis targets show TARGET` for each target's parameters, defaults and ranges) with `--param KEY=VALUE` (repeatable; values are parsed as JSON), e.g. `--param averageNbPhotons=4`.
 
 Add `--json` to `targets`, `run`, `job list`, `job status` and `job result` for machine-readable output.
 

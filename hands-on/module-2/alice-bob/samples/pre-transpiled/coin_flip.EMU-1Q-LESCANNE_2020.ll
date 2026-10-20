@@ -1,3 +1,5 @@
+; Pre-transpiled from samples/coin_flip.py by felis for target EMU:1Q:LESCANNE_2020
+; Run with: ./felis run EMU:1Q:LESCANNE_2020 samples/pre-transpiled/coin_flip.EMU-1Q-LESCANNE_2020.ll
 ; ModuleID = 'circuit-49'
 source_filename = "circuit-49"
 
@@ -8,7 +10,7 @@ define void @circuit-49() #0 {
 entry:
   call void @__quantum__rt__initialize(i8* null)
   call void @__quantum__qis__prepare_x__body(i1 false, %Qubit* null)
-  call void @__quantum__qis__mx__body(%Qubit* null, %Result* null)
+  call void @__quantum__qis__mz__body(%Qubit* null, %Result* null)
   call void @__quantum__rt__array_record_output(i64 1, i8* null)
   call void @__quantum__rt__result_record_output(%Result* null, i8* null)
   ret void
@@ -18,13 +20,14 @@ declare void @__quantum__rt__initialize(i8*)
 
 declare void @__quantum__qis__prepare_x__body(i1, %Qubit*)
 
-declare void @__quantum__qis__mx__body(%Qubit*, %Result*)
+declare void @__quantum__qis__mz__body(%Qubit*, %Result* writeonly) #1
 
 declare void @__quantum__rt__array_record_output(i64, i8*)
 
 declare void @__quantum__rt__result_record_output(%Result*, i8*)
 
 attributes #0 = { "entry_point" "output_labeling_schema" "qir_profiles"="custom" "required_num_qubits"="1" "required_num_results"="1" }
+attributes #1 = { "irreversible" }
 
 !llvm.module.flags = !{!0, !1, !2, !3}
 
